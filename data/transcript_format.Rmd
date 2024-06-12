@@ -1,0 +1,131 @@
+---
+title: "transcript_format"
+output: html_document
+date: "2024-1-11"
+---
+
+```{r}
+library(readr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(tidyverse)
+library(readxl)
+library(plyr)
+library(udpipe)
+```
+
+# read in transcripts
+```{r}
+
+all_csvs <- list.files('./Transcripts', recursive = TRUE, full.names = FALSE)
+
+transcripts <- read_excel("./transcript_template.xlsx")
+
+```
+
+# extract IDs and session info, combine transcripts into a single dataframe 
+```{r}
+
+for (x in all_csvs) {
+  id <- strsplit(x, split = '/')[[1]][1]
+  vid <- substr(x, 22,22)
+  sess <- substr(x, 25, 26)
+  d <- read_excel(paste('./Transcripts/', x, sep="")) %>% mutate()
+  d$start_time <- as.numeric(d$start_time)
+  d$end_time <- as.numeric(d$end_time)
+  d['file'] = x
+  d['pid'] = id
+  d['vid'] = vid
+  d['sid'] = sess
+  d['max_time'] = max(c(d$start_time, d$end_time), na.rm = TRUE)
+  d['max_utt_no'] = max(d$utterance_no, na.rm = TRUE)
+  transcripts <- rbind.fill(d, transcripts)
+}
+
+detach(package:plyr)
+
+```
+
+# correct time markers and utterance numbers
+```{r} 
+session_adjusted <- transcripts %>% select(pid, sid, vid, max_time, max_utt_no) %>% distinct() %>% group_by(pid, sid) %>% mutate(time_offset = sum(max_time), utt_offset = sum(max_utt_no)) %>% arrange(vid) %>% arrange(sid) %>% arrange(pid)
+
+t_offset <- numeric()
+u_offset <- numeric()
+for (row in 1:nrow(session_adjusted)) {
+  if (session_adjusted[row, "vid"] == "1") {
+    s_time <- session_adjusted[row, "max_time"]
+    session_adjusted[row, "time_offset"] = 0
+    s_utt <- session_adjusted[row, "max_utt_no"] + 1
+    session_adjusted[row, "utt_offset"] = 0
+  } else {
+    session_adjusted[row, "time_offset"] = s_time
+    s_time <- session_adjusted[row, "time_offset"] + session_adjusted[row, "max_time"]
+    session_adjusted[row, "utt_offset"] = s_utt
+    s_utt <- session_adjusted[row, "utt_offset"] + session_adjusted[row, "max_utt_no"] + 1
+  }
+}
+
+transcripts <- left_join(transcripts, session_adjusted) %>% mutate(utterance_no = utterance_no + utt_offset, start_time = start_time + time_offset, end_time = end_time + time_offset) %>% arrange(pid, sid, vid)
+
+transcripts <- transcripts %>% group_by(pid, sid) %>% mutate(s_length = max(c(start_time, end_time), na.rm = TRUE))
+
+```
+
+# read in demographics
+```{r}
+demo <- read.csv("./session_demographics.csv", colClasses=c(pid="character"))
+
+# join demographic information with transcripts
+full_transcript <- left_join(transcripts, demo) %>% mutate(file = paste(pid,sid,sep="-"))
+
+```
+
+# filter for validated utterances
+```{r}
+validate_transcripts <- full_transcript %>% distinct() %>% filter(!is.na(manual_transcript)) %>% select(file, vid, start_time, end_time, text, manual_transcript, notes, age, speaker)
+
+# replace original utterances with corrected utterances
+
+for (row in 1:nrow(full_transcript)) {
+  if (!is.na(full_transcript[row, "manual_transcript"])) {
+    full_transcript[row, "text"] <- full_transcript[row, "manual_transcript"]
+  }  
+}
+
+final_transcript <- full_transcript %>% select(file, utterance_no, start_time, end_time, text, speaker, context, pid, vid, sid, hispanic, ethnicity, gender, age, age_group, s_length) %>% distinct()
+
+```
+
+# create tokenized file
+```{r} 
+model <- udpipe_download_model(language = "english")
+udmodel <- udpipe_load_model(file = model$file_model)
+
+tagged_data <- data.frame()
+
+for (i in 1:nrow(final_transcript)) {
+  tagged <- as.data.frame(udpipe_annotate(udmodel, x = final_transcript$text[i])) %>% mutate(file = final_transcript$file[i]) %>% select(file, token, lemma, upos)
+  tagged_row <- left_join(tagged, final_transcript[i,], by = "file")
+  tagged_data <- rbind(tagged_data, tagged_row)
+}
+
+#filter out punctuation and symbols
+
+token_transcript <- tagged_data %>% filter(!(upos %in% c("PUNCT","SYM")))
+
+```
+
+# write validation file and full transcript files
+```{r}
+write_csv(validate_transcripts, './validate_transcripts.csv')
+write_csv(final_transcript, './final_transcripts.csv')
+write_csv(token_transcript, './token_transcripts.csv')
+
+```
+
+
+

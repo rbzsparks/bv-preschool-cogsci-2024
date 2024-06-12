@@ -1,0 +1,14 @@
+Context,Recording Time (Minutes),# of Utterances,# of Tokens
+indoor_blocks,65.5,1131,5489
+indoor_crafts,169,3705,20078
+indoor_news,58.7,1409,8131
+indoor_other,72.1,1556,8069
+indoor_pretend,4.06,110,535
+indoor_puzzle,54.2,1165,5967
+indoor_snack,579,14257,82121
+indoor_story,43.9,961,5560
+outdoor_grass,238,4527,24814
+outdoor_hood,179,3450,16922
+outdoor_other,71.1,1163,5971
+outdoor_patio,272,5257,27706
+outdoor_sand,157,3184,16261

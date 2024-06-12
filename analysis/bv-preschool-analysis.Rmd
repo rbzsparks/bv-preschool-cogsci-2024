@@ -1,0 +1,936 @@
+---
+title: "bv-cogsci-analysis"
+output: html_document
+date: "2024-01-15"
+---
+
+# Set up and libraries
+Load required libraries
+```{r}
+library(readr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(tidyverse)
+library(tokenizers)
+library(koRpus)
+library(koRpus.lang.en)
+# added bll
+library(here)
+library(ggthemes)
+library(egg) # plot compilation
+library(lme4)
+```
+
+## Load analysis functions
+```{r}
+source(here("analysis", "analysis_functions.R"))
+```
+
+# Basic data preprocessing
+## Load data and parse utterances
+
+```{r}
+unfiltered_data <- read.csv(here("data", "final_transcripts.csv")) %>% filter(!is.na(speaker))
+data_filtered <- unfiltered_data %>% filter(s_length >= 180)
+
+spelling_fix <- read.csv(here("data", "spelling_fix.csv"))
+data_fixed <- data_filtered |> 
+  left_join(spelling_fix |> select(-text), by = c("file", "utterance_no")) |> 
+  mutate(text = coalesce(text_corrected, text)) |> 
+  select(-text_corrected)
+```
+
+## Split up utterances 
+Split into smaller chunks so they are more comparable to other kinds of utterances
+
+Linearly interpolate the timestamps for the different utternaces (matters for by speakers/by context coding)
+
+Assuming that number of utterances split out from a large utterances all take around the same time
+
+Won't make any difference to our metrics for right now how we interpolate the timestamps.
+```{r}
+data <- data_fixed |> 
+  mutate(text = str_split(text, "(?<=[.?!])( |$)") |> 
+           lapply(\(x) x[x != ""])) |> 
+  unnest(text) |> 
+  nest(data = -c(file, utterance_no)) |> 
+  mutate(data = lapply(data, \(d) {
+    utt_count <- nrow(d)
+    if (utt_count == 1) return(d)
+    dur <- d$end_time[1] - d$start_time[1] # duration of utterance block
+    per <- dur / utt_count # divide by number of utterance -
+    d |> 
+      mutate(start_time = d$start_time[1] + per * seq(0, utt_count-1),
+             end_time = d$start_time[1] + per * seq(1, utt_count))
+  })) |> 
+  unnest(data) |> 
+  nest(utterances = -c(file)) |> 
+  mutate(utterances = lapply(utterances, \(u) {
+    u |> mutate(utterance_no = seq_along(text)-1)})) |> 
+  unnest(utterances)
+
+
+save(data, file=here::here('data/preprocessed_data.RData'))
+```
+
+## Now load tokenized data
+```{r}
+unfiltered_token_data <- read.csv(here::here("data/token_transcripts.csv")) %>%
+    filter(!is.na(token))
+
+validated_set <- read.csv(here::here("data/validate_transcripts.csv")) %>%   group_by(file,vid) %>% 
+  mutate(s_length = (max(c(start_time, end_time), na.rm = TRUE) - min(c(start_time, end_time), na.rm=TRUE))) %>% 
+  ungroup()
+
+token_data <- unfiltered_token_data %>% 
+  filter(s_length >= 180)
+```
+
+Get corpus variables to render in rMarkdown
+```{r}
+#Filtered variables
+length <- data %>% select(file, s_length) %>% distinct() %>% summarise(sum(s_length)/60)
+total_utterances <- data %>% nrow() %>% as.numeric()
+adult_utt <- data %>% filter(speaker %in% c('radult','tadult')) %>% nrow() %>% as.numeric()
+
+child_utt <- data %>% filter(speaker %in% c('kchild','ochild')) %>% nrow() %>% as.numeric()
+kchild_utt <- data %>% filter(speaker == 'kchild') %>% nrow() %>% as.numeric()
+ochild_utt <- data %>% filter(speaker == 'ochild') %>% nrow() %>% as.numeric()
+
+adult_tokens <- token_data %>% filter(speaker %in% c('radult','tadult')) %>% nrow() %>% as.numeric()
+kchild_tokens <- token_data %>% filter(speaker == 'kchild') %>% nrow() %>% as.numeric()
+ochild_tokens <- token_data %>% filter(speaker == 'ochild') %>% nrow() %>% as.numeric()
+
+radult_utt <- data %>% filter(speaker == "radult") %>% nrow() %>% as.numeric()
+
+tadult_utt <- data %>% filter(speaker == "tadult") %>% nrow() %>% as.numeric()
+total_tokens <- token_data %>% nrow() %>% as.numeric()
+
+# Unfiltered variables 
+unfiltered_length <- unfiltered_data %>% select(file, s_length) %>% distinct() %>% summarise(sum(s_length)/60)
+total_utterances_unfiltered <- unfiltered_data %>% nrow() %>% as.numeric()
+adult_utt_unfiltered <- unfiltered_data %>% filter(speaker %in% c('radult','tadult')) %>% nrow() %>% as.numeric()
+child_utt_unfiltered <- unfiltered_data %>% filter(speaker %in% c('kchild','ochild')) %>% nrow() %>% as.numeric()
+
+#Validation Variables 
+val_length <- validated_set %>% select(file, vid, s_length) %>% distinct() %>% summarise(sum(s_length)/60)
+validated_utt <- validated_set %>% nrow() %>% as.numeric()
+val_adult_utt <- validated_set %>% filter(speaker %in% c('radult','tadult')) %>% nrow() %>% as.numeric()
+val_child_utt <- validated_set %>% filter(speaker %in% c('kchild','ochild')) %>% nrow() %>% as.numeric()
+val_videos <- validated_set %>% select(file, vid) %>% unique() %>% nrow() %>% as.numeric()
+val_sessions <- validated_set %>% select(file) %>% unique() %>% nrow() %>% as.numeric()
+
+
+# Recording Times
+avg_total_child <- data %>% select(file, pid, s_length) %>% distinct() %>% group_by(pid) %>% summarise(length = sum(s_length)) %>% summarise(mean(length))/60
+
+range_total_child <- data %>% select(file, pid, s_length) %>% distinct() %>% group_by(pid) %>% summarise(length = sum(s_length))
+
+
+```
+
+
+Load demographics
+```{R}
+demographics <- read.csv(here::here('data/demographics.csv'))  %>%
+  rename(pid = sid)
+```
+
+# Preprocess 
+
+## Get Summary Count of Utterances and Tokens by Speaker
+```{r}
+speaker_count <- data %>% group_by(speaker) %>% summarise(speaker_count = n())
+speaker_token_count <- token_data %>% group_by(speaker) %>% summarise(speaker_count = n())
+```
+
+
+Combine adult codes
+```{r}
+data <- data %>% mutate(speaker = fct_collapse(speaker, "adult" = c("radult","tadult")))
+
+token_data  <- token_data %>% mutate(speaker = fct_collapse(speaker, "adult" = c("radult","tadult")))
+
+```
+
+## Get speaker BY context for analtsis
+```{r}
+token_data_by_context_by_speaker <- token_data %>%
+  mutate(context_by_speaker = paste0(context,'-', speaker))
+
+data_by_context_by_speaker <- data %>%
+  mutate(context_by_speaker = paste0(context,'-', speaker))
+```
+
+```{r}
+context_lengths <- data %>% mutate(context_by_speaker = paste0(context,'-', speaker), utt_length = end_time - start_time) %>% group_by(context_by_speaker) %>% mutate(s_length = sum(utt_length, na.rm = TRUE)) %>% select(context_by_speaker, s_length) %>% distinct()
+```
+
+## Num tokens/utterances by speaker/context
+```{r}
+token_data_by_context_by_speaker_summary <- token_data %>%
+  mutate(context_by_speaker = paste0(context,'-', speaker)) %>%
+  group_by(context_by_speaker, context, speaker) %>%
+  summarize(num_tokens = length(token)) %>%
+  mutate(location = str_split_fixed(context,'_',2)[,1])
+
+file_token_data_by_context_by_speaker_summary <- token_data %>%
+  mutate(context_by_speaker = paste0(context,'-', speaker)) %>%
+  group_by(context_by_speaker, file, context, speaker) %>%
+  summarize(num_tokens = length(token))
+
+```
+
+```{r}
+token_data_by_session_summary <- token_data %>%
+  group_by(file) %>%
+  summarize(num_tokens = length(token))
+
+data_by_context_by_speaker_summary <- data %>%
+  mutate(context_by_speaker = paste0(context,'-', speaker)) %>%
+  group_by(context_by_speaker, context, speaker) %>%
+  summarize(num_utterances = length(text)) %>%
+  mutate(location = str_split_fixed(context,'_',2)[,1])
+```
+
+Session data for appending to summarized data
+```{r}
+session_data <- data %>% select(file, age, pid, age_group, gender, s_length) %>% distinct()
+```
+
+# Calculate main descriptives by context/speaker
+
+# Speech rate
+## Number of Utterances Normalized by Time
+```{r}
+### Speaker
+sp_un <- data %>% group_by(speaker) %>% summarise(get_norm_utterance(cur_data())) %>%
+  left_join(session_data)
+```
+
+```{R}
+### Context
+cont_un <- data %>% group_by(context) %>% summarise(get_norm_utterance(cur_data()))
+```
+
+
+## Plot 1a: Utterances by age
+```{r}
+plot1a <- ggplot(data=sp_un %>% filter(speaker=='kchild'), aes(x=age, y=utt_norm, size=s_length, col=speaker)) +
+  geom_point(alpha=.4) +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  theme(legend.position = 'none') + 
+  ylab('Normed utterances') + 
+  theme_few(base_size=10) +
+  geom_smooth(aes(group=speaker), span=20) +
+  xlab('Age (in years)') +
+  theme(legend.position = 'none')
+```
+
+```{r}
+summary(lmer(data = sp_un %>% filter(speaker=='kchild'), utt_norm ~ age + (1 | pid)))
+```
+
+### Context by speaker
+```{r}
+un_by_context_by_speaker <- data_by_context_by_speaker  %>% 
+  mutate(file = context_by_speaker) %>% 
+  select(-(s_length)) %>% 
+  left_join(context_lengths, by="context_by_speaker") %>%    get_norm_utterance() %>% 
+  rename(context_by_speaker = file) %>% 
+  ungroup() %>%
+  mutate(context = str_split_fixed(context_by_speaker, '-',2)[,1])  %>%
+  mutate(speaker = str_split_fixed(context_by_speaker, '-',2)[,2]) %>%
+  filter(!context %in% c('indoor_other','outdoor_other'))
+```
+
+### Calculate proxy for adult invovlement in activites
+```{r}
+adult_involvement <- un_by_context_by_speaker %>%
+  filter(speaker=='adult') %>%
+  select(context, utt_norm)  %>%
+  rename(adult_speech_rate = utt_norm) %>%
+  arrange(adult_speech_rate)
+```
+
+
+```{r}
+un_by_context_by_speaker_plot <- un_by_context_by_speaker %>%
+  mutate(context_short = str_split_fixed(context,'_',2)[,2]) %>%
+  group_by(context) %>%
+  mutate(avg_utt_rate = mean(utt_norm)) %>%
+  ungroup %>%
+  mutate(context_short= fct_reorder(context_short, avg_utt_rate, .desc=TRUE)) %>%
+  left_join(data_by_context_by_speaker_summary) 
+```
+
+
+
+
+### Plot Figure 2A: Utterance by context/speaker
+```{R}
+plot2a = ggplot(data=un_by_context_by_speaker_plot, aes(x=context_short, y=utt_norm, color=speaker)) +
+  geom_point(aes(size=num_utterances), alpha=.6) +
+  theme_few(base_size=10) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab('Activity context') +
+  ylab('# Utterances / Second')  +
+  scale_color_brewer(name="", palette='Dark2', direction=-1)  +
+  theme(legend.position='none') +
+  facet_grid(~location, scales = "free_x")
+
+```
+
+```{R}
+# plot2a = ggplot(data=un_by_context_by_speaker_plot, aes(x=context, y=utt_norm, color=speaker)) +
+#   geom_point(aes(size=num_utterances), alpha=.6) +
+#   theme_few(base_size=10) +
+#   coord_flip() +
+#   xlab('Activity context') +
+#   ylab('# Utterances / Second')  +
+#   scale_color_brewer(name="", palette='Dark2', direction=-1)  +
+#   theme(legend.position='none') +
+#   facet_grid(~location)
+
+```
+
+
+
+## Number of Tokens Normalized by Time
+```{R}
+### Speaker
+sp_tn <- token_data %>% group_by(speaker) %>% summarise(get_norm_token(cur_data())) %>%
+  left_join(session_data)
+
+```
+
+
+### Plot 1b: Tokens by age
+
+```{r}
+ggplot(data=sp_tn %>% filter(speaker=='kchild'), aes(x=age, y=token_norm, col=speaker)) +
+  geom_point(alpha=.4, aes(size=s_length)) +
+  scale_color_manual(values = c("#7570B3")) +
+  geom_line(aes(group=pid), alpha=.2) +
+  theme(legend.position = 'none') + 
+  theme_few() +
+  ylab('# Tokens / time') + 
+  ylim(0,1) +
+  xlim(2.8, 6) +
+  # scale_y_continuous(breaks=c(0,.25,.5,.75,1))+   theme_few(base_size=10) +
+  geom_smooth(aes(group=speaker, weight=s_length), span=20, method='lm') +
+  xlab('Age (in years)') +
+  theme(legend.position = 'none')
+```
+
+
+```{r}
+tokens_by_age_out = summary(lm(data = sp_tn %>% filter(speaker=='kchild'), token_norm ~ age))
+```
+
+
+```{r}
+### Context
+cont_tn <- token_data %>% group_by(context) %>% summarise(get_norm_token(cur_data()))
+### Context by Speaker
+```
+
+
+```{r}
+tn_by_context_by_speaker <- token_data_by_context_by_speaker  %>% mutate(file = context_by_speaker) %>% select(-(s_length)) %>% left_join(context_lengths, by="context_by_speaker") %>% get_norm_token() %>% rename(context_by_speaker = file) %>% ungroup() %>%
+  mutate(context = str_split_fixed(context_by_speaker, '-',2)[,1])  %>%
+  mutate(speaker = str_split_fixed(context_by_speaker, '-',2)[,2]) %>%
+  filter(!context %in% c('indoor_other','outdoor_other')) %>%
+  # group_by(context) %>%
+  ungroup() %>%
+  left_join(adult_involvement) %>%
+  mutate(context = fct_reorder(context, adult_speech_rate, .desc=TRUE)) %>%
+  left_join(token_data_by_context_by_speaker_summary)
+```
+
+### Plot Figure 2B: Tokens by context by speaker
+
+
+
+```{R}
+plot2b = ggplot(data=tn_by_context_by_speaker, aes(x=context, y=token_norm, color=speaker)) +
+  geom_point(aes(size=num_tokens), alpha=.6) +
+  theme_few(base_size=10) +
+  coord_flip() +
+  xlab('') +
+  ylab('# Tokens / Second')  +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank()) +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  theme(legend.position = 'none')
+
+```
+
+
+
+# Speech complexity/quality
+## Lexical diversity by context/speaker
+```{r}
+ ld_by_context_by_speaker_by_file <- token_data_by_context_by_speaker %>%
+    mutate(file = context_by_speaker) %>%
+    get_ld(measure = "MTLD") %>%
+    rename(file = file_name, ld = value, context_by_speaker = file_name) 
+```
+
+```{r}
+ ld_by_context_by_speaker_temp <- token_data_by_context_by_speaker %>% 
+    mutate(file = context_by_speaker) %>%
+    get_ld(measure = "MTLD") %>%
+    rename(file = file_name, ld = value, context_by_speaker = file_name) 
+```
+
+```{r}
+ld_by_context_by_speaker <- ld_by_context_by_speaker_temp %>% 
+  ungroup() %>%
+  left_join(token_data_by_context_by_speaker_summary) %>%
+  filter(!context %in% c('indoor_other','outdoor_other')) %>%
+  group_by(context) %>%
+  mutate(avg_ld = mean(ld)) %>%
+  ungroup() %>%
+  left_join(token_data_by_context_by_speaker_summary) %>%
+  mutate(indoor_outdoor = str_split_fixed(context,'_',2)[,1]) %>%
+  mutate(context_short = str_split_fixed(context,'_',2)[,2]) %>%
+  ungroup %>%
+  mutate(context_short = fct_reorder(context_short, avg_ld, .desc=TRUE)) %>%
+  mutate(indoor_outdoor = tools::toTitleCase(indoor_outdoor))
+
+
+```
+
+### Plot: Figure 2C
+```{R}
+location_avg <-  ld_by_context_by_speaker %>%
+  group_by(indoor_outdoor, speaker) %>%
+  summarize(mean_ld = weighted.mean(ld, num_tokens))
+
+plot2c_new <- ggplot(data=ld_by_context_by_speaker, aes(x=context_short, y=ld, color=speaker)) +
+  geom_point(aes(size=num_tokens), alpha=.6) +
+  theme_few(base_size=10) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab('') +
+  ylab('Lexical Diversity (MTLD)')   +
+  facet_grid(~indoor_outdoor, scales="free_x", space = "free") +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  theme(legend.position = 'none') +
+  geom_hline(data = location_avg, lty = 2, alpha = .5, aes(yintercept = mean_ld, col=speaker))
+
+```
+
+```{R}
+# plot2c = ggplot(data=ld_by_context_by_speaker_cleaned, aes(x=context, y=ld, color=speaker)) +
+#   geom_point(aes(size=num_tokens), alpha=.6) +
+#   theme_few(base_size=10) +
+#   theme(axis.title.y = element_blank(), axis.text.y = element_blank()) +
+#   coord_flip() +
+#   xlab('') +
+#   ylab('Lexical Diversity (MTLD)')   +
+#   facet_grid(~indoor_outdoor) +
+#   scale_color_brewer(name="", palette='Dark2', direction=-1) +
+#   theme(legend.position = 'none')
+
+```
+
+
+### Plot 1: By Age - LD by speaker by age
+```{r}
+sp_ld <- data.frame()
+for (x in unique(token_data$speaker)) {
+  ld_frame <- token_data %>% 
+    ungroup() %>%
+    filter(speaker == x) %>% 
+    get_ld(measure = "MTLD") %>% 
+    rename(file = file_name, ld = value) %>% 
+    mutate(speaker = x) %>% 
+    select(speaker, file, ld)
+  sp_ld <- rbind(sp_ld, ld_frame)
+}
+sp_ld[sapply(sp_ld, is.infinite)] <- NA
+```
+
+
+Now join with session data
+```{r}
+sp_ld_by_age <- sp_ld %>%
+  left_join(session_data, by = "file") %>%
+  left_join(token_data_by_session_summary) 
+```
+
+```{r}
+plot1b <- ggplot(data=sp_ld_by_age, aes(x=age, y=ld, col=speaker)) +
+  geom_point(alpha=.4, aes(size=num_tokens)) +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  theme(legend.position = 'none') + 
+  ylab('Lexical Diveristy (MTLD)') + 
+  theme_few(base_size=10) +
+  geom_smooth(aes(group=speaker, weight=num_tokens), span=20) +
+  xlab('Age (in years)') +
+  theme(legend.position = 'none')
+```
+
+
+
+No effect of age in a simple linear regression
+```{R}
+
+summary(lmer(data=sp_ld_by_age, ld ~ scale(age) + speaker + scale(num_tokens) + (1|pid)))
+```
+
+
+
+## Mean length utterance (MLU)
+```{r}
+### Speaker 
+sp_mlu <- data %>% get_mlu(by = "speaker")
+
+### Context
+cont_mlu <- data %>% get_mlu(by = "context")
+```
+
+### Context by Speaker
+```{r}
+
+mlu_by_context_by_speaker <- data_by_context_by_speaker %>% 
+  get_mlu(by = 'context_by_speaker') %>% 
+  ungroup() %>%
+  left_join(token_data_by_context_by_speaker_summary) %>%
+  filter(!context %in% c('indoor_other','outdoor_other')) %>%
+  group_by(context) %>%
+  mutate(avg_mlu = mean(mlu)) %>%
+  ungroup() %>%
+  mutate(indoor_outdoor = str_split_fixed(context,'_',2)[,1]) %>%
+  mutate(context_short = str_split_fixed(context,'_',2)[,2]) %>%
+  mutate(context_short = fct_reorder(context_short, avg_mlu, .desc=TRUE))  %>%
+  mutate(indoor_outdoor = tools::toTitleCase(indoor_outdoor))
+  
+
+```
+
+```{r}
+# mlu_by_context_by_speaker_with_ci <- mlu_by_context_by_speaker %>%
+#   group_by(speaker, context) %>%
+#   multi_boot_standard(col='mlu') %>%
+#   left_join(token_data_by_context_by_speaker_summary) %>%
+#   left_join(adult_involvement) %>%
+#   ungroup() %>%
+#   mutate(context = fct_reorder(context, adult_speech_rate, .desc=TRUE))
+```
+
+### Plot: Figure 2D
+```{R}
+# plot2d = ggplot(data=mlu_by_context_by_speaker, aes(x=context, y=mlu, color=speaker)) +
+#   geom_point(aes(size=num_tokens), alpha=.6) +
+#   theme_few(base_size=10) +
+#   theme(axis.title.y = element_blank(), axis.text.y = element_blank()) +
+#   coord_flip() +
+#   xlab('') +
+#   ylab('M.L.U.')  +
+#   scale_color_brewer(name="", palette='Dark2', direction=-1) +
+#   theme(legend.position = 'none')
+
+
+```
+
+```{R}
+location_avg <-  mlu_by_context_by_speaker %>%
+  group_by(indoor_outdoor, speaker) %>%
+  summarize(mean_mlu = weighted.mean(mlu, num_tokens))
+
+plot2d_new = ggplot(data=mlu_by_context_by_speaker, aes(x=context_short, y=mlu, color=speaker)) +
+  geom_point(aes(size=num_tokens), alpha=.6) +
+  theme_few(base_size=10) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab('') +
+  ylab('Mean Length of Utterance')   +
+  facet_grid(~indoor_outdoor, scales="free_x", space="free") +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  theme(legend.position = 'none') +
+  geom_hline(data = location_avg, lty = 2, alpha = .5, aes(yintercept = mean_mlu, col=speaker))
+
+```
+
+
+```{R}
+# plot2d_v2 = ggplot(data=mlu_by_context_by_speaker_with_ci, aes(x=context, y=mean, color=speaker)) +
+#   # geom_linerange(aes(y=mean, ymin=ci_lower, ymax = ci_upper), alpha=.6) +
+#   geom_point(aes(size=num_tokens), alpha=.6) +
+#   theme_few(base_size=9) +
+#   coord_flip() +
+#   xlab('') +
+#   ylab('Mean Length of Utterance')  +
+#   # theme(axis.title.y = element_blank(), axis.text.y = element_blank()) +
+#   scale_color_brewer(name="", palette='Dark2', direction=-1) +
+#   theme(legend.position = 'none')
+
+```
+
+## Complexity
+
+### Complexity by context by speaker
+```{r}
+
+complexity_by_context_by_speaker <- token_data_by_context_by_speaker %>% 
+  mutate(file = context_by_speaker) %>% 
+  get_complexity() %>% 
+  rename(complexity = value, context_by_speaker = file) %>%   
+  ungroup() %>%
+  left_join(token_data_by_context_by_speaker_summary) %>%
+  filter(!context %in% c('indoor_other','outdoor_other')) %>%
+  group_by(context) %>%
+  mutate(avg_complexity = mean(complexity)) %>%
+  ungroup() %>%
+  mutate(indoor_outdoor = str_split_fixed(context,'_',2)[,1]) %>%
+  mutate(context_short = str_split_fixed(context,'_',2)[,2]) %>%
+  ungroup() %>%
+  mutate(context_short = fct_reorder(context_short, avg_complexity, .desc=TRUE))  %>%
+  mutate(indoor_outdoor = tools::toTitleCase(indoor_outdoor))
+  
+```
+
+
+```{R}
+location_avg <- complexity_by_context_by_speaker %>%
+  group_by(indoor_outdoor, speaker) %>%
+  summarize(mean_complexity = weighted.mean(complexity, num_tokens))
+
+
+plot2e_new = ggplot(data=complexity_by_context_by_speaker, aes(x=context_short, y=complexity, color=speaker)) +
+  geom_point(aes(size=num_tokens), alpha=.6) +
+  theme_few(base_size=10) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab('') +
+  ylim(0,1) +
+  ylab('Complexity')   +
+  facet_grid(~indoor_outdoor, scales="free_x", space='free') +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  theme(legend.position = 'none') +
+  geom_hline(data = location_avg, lty = 2, alpha = .5, aes(yintercept = mean_complexity, col=speaker))
+
+```
+
+
+
+
+
+
+## Figure 2
+```{r}
+# figure2=ggarrange(plot2a, plot2b, plot2c, plot2d, nrow=1)
+# ggsave(plot=figure2, file='figure2.pdf',width=7.5, height=3, units='in')
+```
+
+
+```{r}
+# library(egg)
+figure2=ggarrange(plot2c_new,  plot2d_new, plot2e_new, nrow=1)
+
+# figure2=ggarrange(plot2c_new,  plot2d_new, plot2e_new, nrow=3)
+# ggsave(plot=figure2, file='figure2.pdf',width=7.5, height=3, units='in')
+```
+
+## Keyness - ARF function adapted from Dawson et al. (2021) 
+```{r}
+lower_token_data <- token_data %>% mutate(token = tolower(token), lemma = tolower(lemma)) 
+
+all_tokens <- lower_token_data |>
+  select(lemma, upos) |>
+  distinct(lemma, .keep_all=T)
+```
+
+## Context Keyness
+
+```{r}
+corr_const <- 10
+keyness_file <- as.data.frame(matrix(nrow=10, ncol=0))
+contexts <- unique(lower_token_data$context) %>% sort()
+
+for (x in 1:length(contexts)) {
+  freq <- lower_token_data |> filter(context == contexts[x]) |> get_norm_freq(all_tokens)
+  reference <- lower_token_data |> filter(context != contexts[x]) |> get_norm_freq(all_tokens)
+  keyness <- left_join(freq, reference, by = c("lemma", "upos")) |>
+  filter(arf_norm.x != 0, arf_norm.y != 0) |>
+  mutate(keyness = (arf_norm.x + corr_const) / (arf_norm.y + corr_const)) |>
+  arrange(desc(keyness)) %>% filter(upos != "PROPN") %>% distinct(lemma, .keep_all=T) %>% head(10) %>% select(lemma)
+  names(keyness)[1] = contexts[x] 
+  keyness_file <- cbind(keyness_file, keyness)
+}
+
+keyness_file <- keyness_file %>% select(-indoor_other,-outdoor_other)
+
+
+```
+
+# Write Keyness Data
+
+```{r}
+save(keyness_file, file=here::here('data/context_keyness.RData'))
+```
+
+
+# Graveyard
+# Generation summaries across speakers and contexts for all metrics, create graphs
+
+```{r}
+speaker_summary <- sp_ld %>% left_join(sp_lexicality) %>% left_join(sp_complexity) %>% left_join(sp_mlu) %>% left_join(sp_un) %>% left_join(sp_tn) %>% left_join(append, by = "file")
+
+context_summary <- cont_ld %>% left_join(cont_lexicality) %>% left_join(cont_complexity) %>% left_join(cont_mlu) %>% left_join(cont_un) %>% left_join(cont_tn) 
+```
+
+
+## Misc. session statistics: Context Changes and Turn Count, normalized by time
+```{r}
+context_changes <- get_code_count(data, 'context') %>% rename(cont_change = count)
+
+turn_count <- get_code_count(data, 'speaker') %>% rename(turn_count = count)
+
+session_summary <- context_changes %>% left_join(turn_count) %>% left_join(append)
+
+```
+
+
+
+
+
+```{r}
+ggplot(data=speaker_summary, aes(x=age, y=lexicality, col=speaker)) +
+  geom_point(alpha=.8,  aes(size=s_length)) +
+  geom_smooth(span=20) +
+  theme_few() +
+  ggtitle('Lexicality by speaker type by age')  +
+  facet_wrap(~speaker)
+```
+
+```{r}
+ggplot(data=speaker_summary, aes(x=age, y=complexity, col=speaker)) +
+  geom_point(alpha=.8,  aes(size=s_length)) +
+  geom_smooth(span=20) +
+  theme_few() +
+  ggtitle('Complexity by speaker type by age')  +
+  facet_wrap(~speaker)
+```
+
+```{r}
+ggplot(data=speaker_summary, aes(x=age, y=mlu, col=speaker)) +
+  geom_point(alpha=.8,  aes(size=s_length)) +
+  geom_smooth(span=20) +
+  theme_few() +
+  ggtitle('MLU by speaker type by age')  +
+  facet_wrap(~speaker)
+```
+
+```{r}
+ggplot(data=speaker_summary, aes(x=age, y=utt_norm, col=speaker)) +
+  geom_point(alpha=.8,  aes(size=s_length)) +
+  geom_smooth(span=20) +
+  theme_few() +
+  ggtitle('Normed number of utterances (by time) x speaker type by age')  +
+  facet_wrap(~speaker)
+```
+
+
+```{r}
+ggplot(data=speaker_summary, aes(x=age, y=token_norm, col=speaker)) +
+  geom_point(alpha=.8,  aes(size=s_length)) +
+  geom_smooth(span=20) +
+  theme_few() +
+  ggtitle('Normed token length by speaker type by age')  +
+  facet_wrap(~speaker)
+```
+
+```{r}
+ggplot(data=speaker_summary, aes(x=age, y=ld, col=speaker)) +
+  geom_point(alpha=.8,  aes(size=s_length)) +
+  geom_smooth(span=20) +
+  theme_few() +
+  ggtitle('Lexical diversity (MTLD) by speaker type by age')  +
+  facet_wrap(~speaker)
+```
+
+# Get corpus frequencies
+
+## Indoor/Outdoor
+```{r}
+# indoor_freq <- token_data |> filter(context %in% c("indoor_snack","indoor_crafts","indoor_puzzle","indoor_pretend","indoor_story","indoor_blocks","indoor_news","indoor_other")) |> get_norm_freq(all_tokens)
+# 
+# outdoor_freq <- token_data |> filter(context %in% c("outdoor_patio","outdoor_hood","outdoor_grass","outdoor_sand","outdoor_other")) |> get_norm_freq(all_tokens)
+```
+
+## Child/Adult
+
+```{r}
+# child_freq <- token_data |> filter(speaker %in% c("kchild","ochild")) |> get_norm_freq(all_tokens)
+# 
+# adult_freq <- token_data |> filter(speaker == "adult") |> get_norm_freq(all_tokens)
+
+```
+
+## Get child/adult and indoor/outdoor keyness
+```{r}
+# corr_const <- 10
+# adult_keyness <- left_join(adult_freq, child_freq, by = c("lemma", "upos")) |>
+#   filter(arf_norm.x != 0, arf_norm.y != 0) |>
+#   mutate(keyness = (arf_norm.x + corr_const) / (arf_norm.y + corr_const)) |>
+#   arrange(desc(keyness)) %>% filter(upos != "PROPN") %>% filter(lemma != "bowman") %>% distinct(lemma, .keep_all=T)%>% head(10) %>% select(lemma) %>% rename(adult = lemma)
+# 
+# child_keyness <- left_join(child_freq, adult_freq, by = c("lemma", "upos")) |>
+#   filter(arf_norm.x != 0, arf_norm.y != 0) |>
+#   mutate(keyness = (arf_norm.x + corr_const) / (arf_norm.y + corr_const)) |>
+#   arrange(desc(keyness)) %>% filter(upos != "PROPN") %>% distinct(lemma, .keep_all=T)%>% head(10) %>% select(lemma) %>% rename(child = lemma)
+# 
+# indoor_keyness <- left_join(indoor_freq, outdoor_freq, by = c("lemma", "upos")) |>
+#   filter(arf_norm.x != 0, arf_norm.y != 0) |>
+#   mutate(keyness = (arf_norm.x + corr_const) / (arf_norm.y + corr_const)) |>
+#   arrange(desc(keyness)) %>% filter(upos != "PROPN") %>% distinct(lemma, .keep_all=T)%>% head(10) %>% select(lemma) %>% rename(indoor = lemma)
+# 
+# outdoor_keyness <- left_join(outdoor_freq, indoor_freq, by = c("lemma", "upos")) |>
+#   filter(arf_norm.x != 0, arf_norm.y != 0) |>
+#   mutate(keyness = (arf_norm.x + corr_const) / (arf_norm.y + corr_const)) |>
+#   arrange(desc(keyness)) %>% filter(upos != "PROPN") %>% distinct(lemma, .keep_all=T)%>% head(10) %>% select(lemma) %>% rename(outdoor = lemma)
+
+```
+
+## write file
+```{r}
+# write.csv(keyness_file, here::here("data/keyness.csv"))
+
+```
+
+
+
+
+```{r}
+context_summary_cleaned <- context_summary %>%
+  filter(!context %in% c('indoor_other','outdoor_other','indoor_pretend')) %>%
+  mutate(activity_type = str_split_fixed(context,'_',2)[,1])
+  
+context_summary_ci_ld <- context_summary_cleaned %>%
+  group_by(context, activity_type) %>%
+  multi_boot_standard(col='ld', na.rm=TRUE) %>%
+  ungroup() %>%
+  mutate(context = fct_reorder(context, mean, .desc=TRUE))   %>%
+  mutate(metric = 'Lexical diversity (MTLD)')
+
+context_summary_ci_mlu <- context_summary_cleaned %>%
+  group_by(context, activity_type) %>%
+  multi_boot_standard(col='mlu', na.rm=TRUE) %>%
+  ungroup() %>%
+  mutate(context = fct_reorder(context, mean, .desc=TRUE))  %>%
+  mutate(metric = 'Mean length of utterance (MLU)')
+
+context_summary_ci_token_norm <- context_summary_cleaned %>%
+  group_by(context, activity_type) %>%
+  multi_boot_standard(col='token_norm', na.rm=TRUE) %>%
+  ungroup() %>%
+  mutate(context = fct_reorder(context, mean, .desc=TRUE)) %>%
+  mutate(metric = 'Normed token count')
+```
+  
+```{r}
+MTLD_by_context <- ggplot(data=context_summary_ci_ld, aes(x=context, y=mean, col=activity_type)) +
+  geom_pointrange(aes(y=mean, ymin=ci_lower, ymax=ci_upper)) +
+  theme_few(base_size=10) +
+  ggtitle('a.')  +
+  coord_flip() +
+  xlab('') +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  ylab('Lexical diversity (MTLD)') +
+  theme(legend.position = 'none')
+```
+
+```{r}
+MLU_by_context <- ggplot(data=context_summary_ci_mlu, aes(x=context, y=mean, col=activity_type)) +
+  geom_pointrange(aes(y=mean, ymin=ci_lower, ymax=ci_upper)) +
+  theme_few(base_size=10) +
+  ggtitle('b.')  +
+  coord_flip() +
+  xlab('') +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  ylab('Mean length of utterance (MLU)') +
+  theme(legend.position = 'none')
+```
+
+```{r}
+Token_count_by_context <- ggplot(data=context_summary_ci_token_norm, aes(x=context, y=mean, col=activity_type)) +
+  geom_pointrange(aes(y=mean, ymin=ci_lower, ymax=ci_upper)) +
+  theme_few(base_size=10) +
+  ggtitle('c.')  +
+  coord_flip() +
+  xlab('') +
+  ylab('Normed token count') +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  theme(legend.position = 'none')
+```
+
+```{r}
+context_plot = egg::ggarrange(MTLD_by_context, MLU_by_context, Token_count_by_context, nrow=1)
+ggsave(plot=context_plot, file = 'context_plot.pdf', width=7, height=4, units='in')
+```
+
+
+## Lexicality
+```{r}
+sp_lexicality <- token_data %>% 
+  group_by(speaker, pid, s_length) %>% 
+  summarize(get_lexicality(cur_data())) %>% 
+  rename(lexicality = value) %>% 
+  select(speaker, file, pid, lexicality, s_length) %>%
+  left_join(session_data)
+```
+
+```{r}
+cont_lexicality <- token_data %>% 
+  group_by(context) %>%
+  summarise(get_lexicality(cur_data())) %>% 
+  rename(lexicality = value) %>% 
+  select(context, file, lexicality)
+```
+
+```{r}
+lex_by_context_by_speaker <- token_data_by_context_by_speaker %>% mutate(file = context_by_speaker) %>% get_lexicality() %>% rename(lexicality = value, context_by_speaker = file) %>% ungroup() %>%
+  mutate(context = str_split_fixed(context_by_speaker, '-',2)[,1])  %>%
+  mutate(speaker = str_split_fixed(context_by_speaker, '-',2)[,2]) %>%
+  group_by(context) %>%
+  mutate(avg_lexicality = mean(lexicality)) %>%
+  ungroup() %>%
+  mutate(context = fct_reorder(context, avg_lexicality, .desc=TRUE)) %>%
+  left_join(token_data_by_context_by_speaker_summary)
+
+```
+
+```{R}
+lexicality_by_context = ggplot(data=lex_by_context_by_speaker, aes(x=context, y=lexicality, color=speaker)) +
+  geom_point(aes(size=num_tokens), alpha=.6) +
+  theme_few(base_size=10) +
+  coord_flip()  +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  theme(legend.position = 'none')
+
+```
+
+
+
+```{r}
+lexicality_by_age = ggplot(data=sp_lexicality, aes(x=age, y=lexicality, col=speaker)) +
+  geom_point(alpha=.8,  aes(size=s_length)) +
+  geom_smooth(span=20) +
+  theme_few(base_size=10) +
+  xlab('Age (in years)') +
+  ylab('Lexicality')  +
+  scale_color_brewer(name="", palette='Dark2', direction=-1) +
+  theme(legend.position = 'none')
+```
+
+```{r}
+ggplot(data=cont_lexicality, aes(x=lexicality)) +
+  geom_histogram() +
+  theme_few() +
+  ggtitle('Lexicality by context type') +
+  facet_wrap(~context, nrow=3)
+```
+
